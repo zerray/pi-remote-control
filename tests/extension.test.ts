@@ -483,6 +483,31 @@ describe("remote control extension", () => {
     expect(statuses.at(-1)).toEqual({ key: "remote-control", text: undefined });
   });
 
+  it("uses a bounded timeout when unregistering during shutdown", async () => {
+    const { pi, commands, handlers } = createFakePi();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(new AbortController().signal);
+    const deleteSignals: AbortSignal[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        if (init?.method === "DELETE" && init.signal instanceof AbortSignal) deleteSignals.push(init.signal);
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }),
+    );
+    const { ctx } = createContext();
+    remoteControlExtension(pi as never);
+    await commands.find((command) => command.name === "remote-control")!.handler("", ctx);
+
+    try {
+      await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+
+      expect(timeout).toHaveBeenCalledWith(5_000);
+      expect(deleteSignals).toHaveLength(1);
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
   it("awaits proactive deactivation before session shutdown completes", async () => {
     const { pi, commands, handlers } = createFakePi();
     const { ctx } = createContext();

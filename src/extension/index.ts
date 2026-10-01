@@ -23,6 +23,7 @@ const remoteReplacementInFlightSessionIds = new Set<string>();
 const localForkRemoteControlDisabledTargetFiles = new Set<string>();
 const agentRunStates = new Map<string, { runSequence: number; terminalCompleted: boolean }>();
 const pendingAgentSettlements = new Map<string, string>();
+const UNREGISTER_TUI_SESSION_TIMEOUT_MS = 5_000;
 
 export function __resetRemoteControlExtensionStateForTests(): void {
   for (const timer of pollTimers.values()) clearInterval(timer);
@@ -307,6 +308,7 @@ async function unregisterTuiSession(sessionId: string): Promise<void> {
   await fetch(`${await daemonBaseUrl()}/v1/tui/sessions/${encodeURIComponent(sessionId)}`, {
     method: "DELETE",
     headers: await tuiHeaders(false),
+    signal: AbortSignal.timeout(UNREGISTER_TUI_SESSION_TIMEOUT_MS),
   });
 }
 
