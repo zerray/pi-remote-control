@@ -46,6 +46,28 @@ describe("session name generation", () => {
     expect(complete.mock.calls[0]?.[2]).not.toHaveProperty("temperature");
   });
 
+  it.each(["authentication", "completion"])("returns no name when %s fails", async (failure) => {
+    const model = { provider: "test", id: "test-model" };
+    const generator = createLlmSessionNameGenerator({
+      modelRegistry: {
+        find: () => model,
+        getAvailable: () => [model],
+        getApiKeyAndHeaders: async () => {
+          if (failure === "authentication") throw new Error("auth unavailable");
+          return { ok: true as const };
+        },
+      },
+      complete: async () => { throw new Error("provider unavailable"); },
+    });
+
+    await expect(generator({
+      sessionId: "sess_1",
+      project: { id: "proj_1", name: "Example", path: "/repo/example" },
+      sessionFile: "/tmp/session.jsonl",
+      messages: [message("user", "Fix login")],
+    })).resolves.toBeNull();
+  });
+
   it("builds a bounded naming prompt from visible conversation text", () => {
     const prompt = buildSessionNamePrompt([
       message("system", "internal instructions"),

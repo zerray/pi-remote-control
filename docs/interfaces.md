@@ -653,6 +653,12 @@ Remote tree navigation error codes are `session_busy`, `tree_state_changed`, `ta
 
 The TUI control interface is package-internal and used by the Pi extension, not by iOS clients. Loopback TUI requests are accepted without a bearer token; non-loopback callers must provide a valid bearer token. The extension normally calls `127.0.0.1:<configured-port>` even when iOS uses `advertisedBaseUrl` over Tailscale.
 
+### Daemon host module resolution
+
+When starting the daemon, the extension sets `PI_REMOTE_CONTROL_PI_ENTRY` only for the child process to the absolute entry-point path of the launching Pi process. The daemon follows entry-point symlinks and resolves optional Pi dependencies relative to that host, not to any stale peers in the extension installation. The entry point is a resolution anchor and is never executed by the daemon.
+
+Manual CLI invocations can supply the same variable. Without it, the daemon uses locally installed peers. Missing or invalid host dependencies yield `piVersion: "unknown"` when version resolution fails and leave generated names unset; they do not prevent daemon startup, status, stop, pairing, or session relay.
+
 ### Pair code creation
 
 `/remote-control-pair` asks the daemon to create one short-lived pair code and displays it in the TUI as a QR code, a desktop pairing hex payload, and expiration time.

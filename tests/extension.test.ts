@@ -200,6 +200,27 @@ describe("remote control extension", () => {
     expect(notifications.at(-1)).toEqual({ message: "Remote control enabled for this session", type: "info" });
   });
 
+  it("passes the launching Pi entry point to the daemon with shell-safe quoting", async () => {
+    const { pi, commands } = createFakePi();
+    const { ctx } = createContext();
+    const exec = vi.fn(async (_command: string, args: string[]) => ({
+      stdout: "", stderr: "", code: args.includes("status") ? 1 : 0, killed: false,
+    }));
+    pi.exec = exec;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 200 })));
+    const originalArgv = process.argv;
+    const hostEntry = "/opt/Pi's installation/dist/cli.js";
+    process.argv = [process.execPath, hostEntry];
+    try {
+      remoteControlExtension(pi as never);
+      await commands.find((command) => command.name === "remote-control")!.handler("", ctx);
+      expect(exec.mock.calls[1]?.[1][1]).toContain("PI_REMOTE_CONTROL_PI_ENTRY='/opt/Pi'\\''s installation/dist/cli.js' nohup ");
+      expect(process.env.PI_REMOTE_CONTROL_PI_ENTRY).not.toBe(hostEntry);
+    } finally {
+      process.argv = originalArgv;
+    }
+  });
+
   it("registers an initial reduced Model Catalog Snapshot", async () => {
     const { pi, commands } = createFakePi();
     const { ctx } = createContext();

@@ -345,7 +345,9 @@ async function ensureDaemonStarted(pi: ExtensionAPI): Promise<void> {
   const status = await pi.exec(cli.command, [...cli.args, "status"]);
   if (status.code === 0) return;
 
-  const shellLine = `nohup ${shellQuote(cli.command)} ${[...cli.args, "start"].map(shellQuote).join(" ")} </dev/null >/tmp/pi-remote-control.log 2>&1 &`;
+  const hostEntry = process.argv[1];
+  const hostEnv = hostEntry ? `PI_REMOTE_CONTROL_PI_ENTRY=${shellQuote(resolve(hostEntry))} ` : "";
+  const shellLine = `${hostEnv}nohup ${shellQuote(cli.command)} ${[...cli.args, "start"].map(shellQuote).join(" ")} </dev/null >/tmp/pi-remote-control.log 2>&1 &`;
   await pi.exec("sh", ["-lc", shellLine]);
   await waitForDaemonReady();
 }

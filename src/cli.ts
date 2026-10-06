@@ -12,6 +12,7 @@ import { createPushSettlementNotifier } from "./push-gateway-client.js";
 import { formatPairingDisplay } from "./qr.js";
 import { startDaemonServer, type DaemonServer, type StartServerOptions } from "./server/http.js";
 import { createLlmSessionNameGenerator } from "./session-name-generator.js";
+import { resolvePiModule } from "./pi-module-resolution.js";
 import type { DaemonConfig } from "./types.js";
 
 export type CliDependencies = {
@@ -194,7 +195,7 @@ async function openStore(stateDir: string): Promise<DaemonStore> {
 
 export async function readInstalledPiVersion(): Promise<string> {
   try {
-    let directory = dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")));
+    let directory = dirname(fileURLToPath(resolvePiModule("@earendil-works/pi-coding-agent")));
     while (true) {
       const packageJsonPath = join(directory, "package.json");
       try {

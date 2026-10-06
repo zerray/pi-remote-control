@@ -1,7 +1,6 @@
-import { completeSimple } from "@earendil-works/pi-ai/compat";
-import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { ActiveSessionNameGenerator } from "./active-session-registry.js";
 import type { TranscriptMessage } from "./types.js";
+import { resolvePiModule } from "./pi-module-resolution.js";
 
 const MAX_PROMPT_MESSAGES = 8;
 const MAX_MESSAGE_CHARS = 500;
@@ -24,28 +23,33 @@ export function createLlmSessionNameGenerator(deps: LlmSessionNameGeneratorDepen
   const complete = deps.complete ?? defaultComplete;
 
   return async (request) => {
-    const modelRegistry = deps.modelRegistry ?? await defaultModelRegistry();
     const prompt = buildSessionNamePrompt(request.messages);
     if (!prompt) return null;
 
-    const preferredModel = request.runtimeStatus?.model
-      ? modelRegistry.find(request.runtimeStatus.model.provider, request.runtimeStatus.model.id)
-      : undefined;
-    const model = preferredModel ?? modelRegistry.getAvailable()[0];
-    if (!model) return null;
+    try {
+      const modelRegistry = deps.modelRegistry ?? await defaultModelRegistry();
+      const preferredModel = request.runtimeStatus?.model
+        ? modelRegistry.find(request.runtimeStatus.model.provider, request.runtimeStatus.model.id)
+        : undefined;
+      const model = preferredModel ?? modelRegistry.getAvailable()[0];
+      if (!model) return null;
 
-    const auth = await modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok) return null;
+      const auth = await modelRegistry.getApiKeyAndHeaders(model);
+      if (!auth.ok) return null;
 
-    const response = await complete(model, {
-      messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
-    }, {
-      apiKey: auth.apiKey,
-      headers: auth.headers,
-      maxTokens: 32,
-      reasoning: "off",
-    });
-    return sanitizeGeneratedSessionName(response.content.flatMap((block) => block.type === "text" && block.text ? [block.text] : []).join(""));
+      const response = await complete(model, {
+        messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
+      }, {
+        apiKey: auth.apiKey,
+        headers: auth.headers,
+        maxTokens: 32,
+        reasoning: "off",
+      });
+      return sanitizeGeneratedSessionName(response.content.flatMap((block) => block.type === "text" && block.text ? [block.text] : []).join(""));
+    } catch {
+      // Naming is optional; missing Pi modules or provider failures must not affect the relay.
+      return null;
+    }
   };
 }
 
@@ -78,11 +82,13 @@ export function sanitizeGeneratedSessionName(name: string | null | undefined): s
 let defaultModelRegistryPromise: Promise<SessionNameModelRegistry> | undefined;
 
 function defaultModelRegistry(): Promise<SessionNameModelRegistry> {
-  defaultModelRegistryPromise ??= ModelRuntime.create().then((runtime) => new ModelRegistry(runtime) as unknown as SessionNameModelRegistry);
+  defaultModelRegistryPromise ??= (import(resolvePiModule("@earendil-works/pi-coding-agent")) as Promise<typeof import("@earendil-works/pi-coding-agent")>)
+    .then(async ({ ModelRegistry, ModelRuntime }) => new ModelRegistry(await ModelRuntime.create()) as unknown as SessionNameModelRegistry);
   return defaultModelRegistryPromise;
 }
 
 async function defaultComplete(model: SessionNameModel, context: { messages: Array<{ role: "user"; content: string; timestamp: number }> }, options?: { apiKey?: string; headers?: Record<string, string>; maxTokens?: number; temperature?: number; reasoning?: "off" }): Promise<{ content: Array<{ type: string; text?: string }> }> {
+  const { completeSimple } = await import(resolvePiModule("@earendil-works/pi-ai/compat")) as typeof import("@earendil-works/pi-ai/compat");
   return completeSimple(model as never, context as never, options as never) as Promise<{ content: Array<{ type: string; text?: string }> }>;
 }
 

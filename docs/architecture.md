@@ -107,6 +107,8 @@ Active TUI sessions are process state, not durable daemon state. This process st
 
 The package can be installed with Pi package installation, for example from a local path, git source, or npm source. The package manifest exposes the extension through the `pi.extensions` field and the daemon binary through the normal package binary entry.
 
+Pi API packages remain host-provided peer dependencies. The independent daemon resolves optional Pi modules through `src/pi-module-resolution.ts`, using the launching TUI's explicit entry point or local peers for standalone installations. Version reporting does not evaluate Pi modules. Session naming loads Pi APIs only on demand and degrades to an unset name if they are unavailable; daemon startup and relay operations do not require them.
+
 Installing the Pi package makes Pi aware of `/remote-control` and `/remote-control-pair`; it does not by itself imply that the daemon process is running or that any TUI session is remotely visible. Pairing QR codes require an advertised base URL that is reachable from iOS, such as a Tailscale HTTPS or HTTP URL.
 
 Remote model selection uses Pi's model registry and `pi.setModel(...)`. Completion notifications additionally require Pi `0.80.4` or newer because `agent_settled` is the only supported completion signal.
