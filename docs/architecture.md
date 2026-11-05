@@ -48,8 +48,9 @@ The extension responsibilities are session-aware:
 - Compute structured runtime-status snapshots from the live TUI context and send them to the daemon when status inputs change.
 - Compute reduced Model Catalog Snapshots from authenticated available models, preserve scoped-model membership, and never report provider credentials or connection settings.
 - Forward TUI session-name changes so explicit user names can override daemon-generated display names.
-- Receive daemon-forwarded prompt, abort, compact, model refresh, model selection, tree-refresh, tree-navigation, fork, and clone commands and apply them to the current live TUI runtime through Pi extension APIs.
-- Report asynchronous compact, model-catalog, model-selection, tree-navigation, fork, clone, and session-replacement results back to the daemon for iOS WebSocket subscribers.
+- Receive daemon-forwarded prompt, abort, compact, model refresh, model selection, tree-refresh, tree-navigation, fork, clone, and UI prompt response commands and apply them to the current live TUI runtime through Pi extension APIs.
+- Report asynchronous compact, model-catalog, model-selection, tree-navigation, fork, clone, UI prompt, and session-replacement results back to the daemon for iOS WebSocket subscribers.
+- Wrap the session's shared `ctx.ui` dialog methods so open extension `select`, `confirm`, `input`, and `editor` prompts are published as UI Prompts and can be resolved by a validated remote response; prompts opened while remote control is inactive are reported in the next registration.
 - Report `agent_settled` as an idempotent Agent Settlement after at least one non-aborted, non-error agent run, without inferring settlement from `agent_end` or transcript events.
 
 The extension owns live Pi session control. It does not expose a network listener to iOS.
@@ -62,9 +63,9 @@ The daemon responsibilities are independent of Pi SDK session ownership:
 - Enforce device token authentication for iOS requests and non-loopback TUI control requests.
 - Persist pairing codes, paired device token hashes, and daemon metadata.
 - Track currently activated TUI sessions and group them into projects for iOS display.
-- Relay prompt, abort, compact, model refresh, model selection, tree-refresh, tree-navigation, fork, and clone requests from iOS to the TUI extension that owns the target session.
-- Forward TUI-reported compact, model-catalog, model-selection, tree, navigation, fork, clone, and replacement results to subscribed iOS clients.
-- Store the latest TUI-reported runtime-status, Model Catalog Snapshot, and tree snapshot for each active session and include runtime status in session state sent to iOS.
+- Relay prompt, abort, compact, model refresh, model selection, tree-refresh, tree-navigation, fork, clone, and UI prompt response requests from iOS to the TUI extension that owns the target session.
+- Forward TUI-reported compact, model-catalog, model-selection, tree, navigation, fork, clone, UI prompt, and replacement results to subscribed iOS clients.
+- Store the latest TUI-reported runtime-status, Model Catalog Snapshot, tree snapshot, and open UI Prompts for each active session and include runtime status and open UI Prompts in session state sent to iOS.
 - Associate an opaque Push Route with the paired device resolved from request authentication and invoke the configured central Push Gateway on an idempotent Agent Settlement.
 - Generate short ephemeral display names for unnamed active sessions with an LLM and expose them through session APIs until a TUI-provided name overrides them.
 - Serve bounded recent transcript snapshots and older transcript pages for active sessions by reading Pi session JSONL files, filtering to the TUI-reported active branch when tree state is available, and normalizing entries into public `TranscriptMessage` values.
@@ -111,4 +112,4 @@ Pi API packages remain host-provided peer dependencies. The independent daemon r
 
 Installing the Pi package makes Pi aware of `/remote-control` and `/remote-control-pair`; it does not by itself imply that the daemon process is running or that any TUI session is remotely visible. Pairing QR codes require an advertised base URL that is reachable from iOS, such as a Tailscale HTTPS or HTTP URL.
 
-Remote model selection uses Pi's model registry and `pi.setModel(...)`. Completion notifications additionally require Pi `0.80.4` or newer because `agent_settled` is the only supported completion signal.
+Remote model selection uses Pi's model registry and `pi.setModel(...)`. Remote UI prompts rely on Pi giving every extension in a session the same mutable `ctx.ui` object and on the `signal` dialog option; `tests/ui-prompt-bridge-pi.test.ts` exercises the real Pi extension runner to catch upstream changes to that behavior. Completion notifications additionally require Pi `0.80.4` or newer because `agent_settled` is the only supported completion signal.

@@ -1381,6 +1381,132 @@ describe("remote control extension", () => {
     ]);
   });
 
+  describe("remote UI prompts", () => {
+    type DialogUi = Record<"select" | "confirm" | "input" | "editor", (...args: any[]) => Promise<unknown>>;
+
+    function recordFetch() {
+      const registrations: Array<Record<string, unknown>> = [];
+      const events: Array<Record<string, unknown>> = [];
+      vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+        const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
+        if (url.endsWith("/v1/tui/sessions") && body) registrations.push(body);
+        if (url.endsWith("/events") && body) events.push(body);
+        return new Response(JSON.stringify({ session: { id: "sess_pi_1" }, commands: [] }), { status: 200 });
+      }));
+      const promptEvents = () => events.filter((event) => String(event.type).includes("ui_prompt"));
+      return { registrations, promptEvents };
+    }
+
+    function dismissibleDialog(): (...args: any[]) => Promise<unknown> {
+      return vi.fn((_title: unknown, _detail: unknown, options?: { signal?: AbortSignal }) => new Promise((resolve) => {
+        options?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+      }));
+    }
+
+    async function enableRemoteControl(ui: Partial<DialogUi>) {
+      const fake = createFakePi();
+      const context = createContext();
+      Object.assign(context.ctx.ui, ui);
+      remoteControlExtension(fake.pi as never);
+      await fake.commands.find((command) => command.name === "remote-control")!.handler("", context.ctx);
+      return { ...fake, ctx: context.ctx, ui: context.ctx.ui as unknown as DialogUi };
+    }
+
+    it("publishes a blocked select and resolves it with a validated remote answer", async () => {
+      const { promptEvents } = recordFetch();
+      const select = dismissibleDialog();
+      const { pi, ctx, ui } = await enableRemoteControl({ select });
+
+      const answer = ui.select("Allow rm -rf build?", ["Allow", "Block"], { timeout: 30_000 });
+      await vi.waitFor(() => expect(promptEvents()).toHaveLength(1));
+      const opened = promptEvents()[0]!;
+      expect(opened).toEqual({
+        type: "ui_prompt_opened",
+        prompt: { promptId: expect.stringMatching(/^uip_/), kind: "select", title: "Allow rm -rf build?", options: [{ optionId: "opt_0", label: "Allow" }, { optionId: "opt_1", label: "Block" }], createdAt: expect.any(String) },
+      });
+      const promptId = (opened.prompt as { promptId: string }).promptId;
+
+      handleRemoteCommand(pi as never, ctx as never, { type: "remote_ui_prompt_response", requestId: "req_1", promptId, response: { type: "option", optionId: "opt_1" } }, "sess_pi_1");
+
+      await expect(answer).resolves.toBe("Block");
+      const localOptions = vi.mocked(select).mock.calls[0]![2] as { signal: AbortSignal; timeout: number };
+      expect(localOptions.timeout).toBe(30_000);
+      expect(localOptions.signal.aborted).toBe(true);
+      await vi.waitFor(() => expect(promptEvents()).toEqual([
+        opened,
+        { type: "remote_ui_prompt_result", requestId: "req_1", promptId, ok: true },
+        { type: "ui_prompt_closed", promptId },
+      ]));
+    });
+
+    it("keeps the local answer when the TUI answers first and reports late remote answers as closed", async () => {
+      const { promptEvents } = recordFetch();
+      let answerLocally!: (value: boolean) => void;
+      const confirm = vi.fn(() => new Promise<boolean>((resolve) => {
+        answerLocally = resolve;
+      }));
+      const { pi, ctx, ui } = await enableRemoteControl({ confirm });
+
+      const answer = ui.confirm("Push?", "3 commits");
+      await vi.waitFor(() => expect(promptEvents()).toHaveLength(1));
+      const promptId = (promptEvents()[0]!.prompt as { promptId: string }).promptId;
+      answerLocally(true);
+      await expect(answer).resolves.toBe(true);
+
+      handleRemoteCommand(pi as never, ctx as never, { type: "remote_ui_prompt_response", requestId: "req_late", promptId, response: { type: "confirm", confirmed: false } }, "sess_pi_1");
+
+      await vi.waitFor(() => expect(promptEvents().slice(1)).toEqual([
+        { type: "ui_prompt_closed", promptId },
+        { type: "remote_ui_prompt_result", requestId: "req_late", promptId, ok: false, error: "ui_prompt_closed" },
+        { type: "ui_prompt_closed", promptId },
+      ]));
+    });
+
+    it("cancels open prompts on remote abort so a blocked run can stop", async () => {
+      const { promptEvents } = recordFetch();
+      const { pi, ctx, ui } = await enableRemoteControl({ confirm: dismissibleDialog(), input: dismissibleDialog() });
+      const abort = vi.fn();
+
+      const confirmed = ui.confirm("Run migration?", "This rewrites the database");
+      const typed = ui.input("Branch name", "main");
+      await vi.waitFor(() => expect(promptEvents()).toHaveLength(2));
+      handleRemoteCommand(pi as never, { ...ctx, abort } as never, { type: "remote_abort", requestId: "req_abort" }, "sess_pi_1");
+
+      await expect(confirmed).resolves.toBe(false);
+      await expect(typed).resolves.toBeUndefined();
+      expect(abort).toHaveBeenCalledOnce();
+    });
+
+    it("answers an editor remotely even though Pi cannot dismiss the local editor", async () => {
+      const { promptEvents } = recordFetch();
+      const editor = vi.fn(() => new Promise<string | undefined>(() => undefined));
+      const { pi, ctx, ui } = await enableRemoteControl({ editor });
+
+      const edited = ui.editor("Refine the plan:", "step 1");
+      await vi.waitFor(() => expect(promptEvents()).toHaveLength(1));
+      const promptId = (promptEvents()[0]!.prompt as { promptId: string }).promptId;
+      handleRemoteCommand(pi as never, ctx as never, { type: "remote_ui_prompt_response", requestId: "req_1", promptId, response: { type: "text", text: "step 1\nstep 2" } }, "sess_pi_1");
+
+      await expect(edited).resolves.toBe("step 1\nstep 2");
+      expect(editor).toHaveBeenCalledWith("Refine the plan:", "step 1");
+    });
+
+    it("includes prompts opened before /remote-control in the registration", async () => {
+      const { registrations, promptEvents } = recordFetch();
+      const { pi, commands, handlers } = createFakePi();
+      const { ctx } = createContext();
+      Object.assign(ctx.ui, { input: dismissibleDialog() });
+      remoteControlExtension(pi as never);
+      handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+
+      void (ctx.ui as unknown as DialogUi).input("Ticket id", "PI-123");
+      await commands.find((command) => command.name === "remote-control")!.handler("", ctx);
+
+      expect(registrations[0]?.uiPrompts).toEqual([{ promptId: expect.stringMatching(/^uip_/), kind: "input", title: "Ticket id", placeholder: "PI-123", createdAt: expect.any(String) }]);
+      expect(promptEvents()).toEqual([]);
+    });
+  });
+
   it("runs local pairing command from remote-control-pair", async () => {
     const execCalls: ExecCall[] = [];
     const { pi, commands } = createFakePi(execCalls);

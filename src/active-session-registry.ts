@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { activeBranchEntryIds, activeBranchEntryIdsFromSessionFile, readSessionTranscriptMessages, visibleConversationMessageCount } from "./session-transcript.js";
 import { DEFAULT_TRANSCRIPT_PAGE_LIMIT, olderTranscriptPage, recentTranscriptWindow, type TranscriptPage } from "./transcript-pagination.js";
 import type { AgentSettlement, ModelCatalogSnapshot, RuntimeStatus, ToolCallStatus, TreeSnapshot } from "./types.js";
+import type { UiPrompt, UiPromptResponse } from "./ui-prompt.js";
 
 export type ActiveProject = {
   id: string;
@@ -23,6 +24,7 @@ export type ActiveSessionRegistration = {
   modelCatalog?: ModelCatalogSnapshot;
   treeSnapshot?: TreeSnapshot;
   treeStateStale?: boolean;
+  uiPrompts?: UiPrompt[];
   entries?: unknown[];
 };
 
@@ -46,7 +48,8 @@ export type RemoteTuiCommand =
   | { type: "remote_tree_refresh"; requestId: string }
   | { type: "remote_tree_navigate"; requestId: string; targetEntryId: string; baseSnapshotVersion: string; baseBranchVersion: string; baseLeafId: string | null; summaryMode: "none" | "default" }
   | { type: "remote_fork"; requestId: string; targetEntryId: string; baseSnapshotVersion: string; baseBranchVersion: string; baseLeafId: string | null }
-  | { type: "remote_clone"; requestId: string; baseSnapshotVersion: string; baseBranchVersion: string; baseLeafId: string | null };
+  | { type: "remote_clone"; requestId: string; baseSnapshotVersion: string; baseBranchVersion: string; baseLeafId: string | null }
+  | { type: "remote_ui_prompt_response"; requestId: string; promptId: string; response: UiPromptResponse };
 
 export type ActiveSessionState = TranscriptPage & {
   session: ActiveSessionSummary;
@@ -54,6 +57,7 @@ export type ActiveSessionState = TranscriptPage & {
   isStreaming: boolean;
   pendingMessageCount: number;
   runtimeStatus: RuntimeStatus | null;
+  uiPrompts: UiPrompt[];
 };
 
 export type ActiveSessionTreeSnapshotResult =
@@ -94,6 +98,9 @@ export type ActiveSessionRegistry = {
   updateTreeState(sessionId: string, state: ActiveSessionTreeState): boolean;
   updateRuntimeStatus(sessionId: string, status: RuntimeStatus): boolean;
   updateSessionActivity(sessionId: string, activity: { isStreaming: boolean; pendingMessageCount?: number }): boolean;
+  openUiPrompt(sessionId: string, prompt: UiPrompt): boolean;
+  closeUiPrompt(sessionId: string, promptId: string): boolean;
+  getUiPrompt(sessionId: string, promptId: string): UiPrompt | undefined;
   acceptAgentSettlement(sessionId: string, settlementId: string): AgentSettlement | undefined;
   enqueueCommand(sessionId: string, command: RemoteTuiCommand): boolean;
   takeCommands(sessionId: string): RemoteTuiCommand[];
@@ -113,6 +120,7 @@ type StoredActiveSession = ActiveSessionRegistration & {
   tools: ToolCallStatus[];
   pendingMessageCount: number;
   commands: RemoteTuiCommand[];
+  uiPrompts: UiPrompt[];
   treeState?: ActiveSessionTreeState;
   lastSettlementId?: string;
   lastSeenAtMs: number;
@@ -146,6 +154,7 @@ export function createActiveSessionRegistry(options: ActiveSessionRegistryOption
         tools: [],
         pendingMessageCount: 0,
         commands: [],
+        uiPrompts: session.uiPrompts ?? [],
         lastSeenAtMs: now(),
       });
       if (!summary.name && nameGenerator) {
@@ -219,6 +228,7 @@ export function createActiveSessionRegistry(options: ActiveSessionRegistryOption
         isStreaming: session.isStreaming,
         pendingMessageCount: session.pendingMessageCount,
         runtimeStatus: session.runtimeStatus ?? null,
+        uiPrompts: session.uiPrompts,
       };
     },
 
@@ -297,6 +307,27 @@ export function createActiveSessionRegistry(options: ActiveSessionRegistryOption
       session.isStreaming = activity.isStreaming;
       session.pendingMessageCount = nextPendingMessageCount;
       return changed;
+    },
+
+    openUiPrompt(sessionId, prompt) {
+      pruneInactiveSessions();
+      const session = sessions.get(sessionId);
+      if (!session || session.uiPrompts.some((open) => open.promptId === prompt.promptId)) return false;
+      session.uiPrompts = [...session.uiPrompts, prompt];
+      return true;
+    },
+
+    closeUiPrompt(sessionId, promptId) {
+      pruneInactiveSessions();
+      const session = sessions.get(sessionId);
+      if (!session || !session.uiPrompts.some((open) => open.promptId === promptId)) return false;
+      session.uiPrompts = session.uiPrompts.filter((open) => open.promptId !== promptId);
+      return true;
+    },
+
+    getUiPrompt(sessionId, promptId) {
+      pruneInactiveSessions();
+      return sessions.get(sessionId)?.uiPrompts.find((open) => open.promptId === promptId);
     },
 
     acceptAgentSettlement(sessionId, settlementId) {

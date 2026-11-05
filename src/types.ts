@@ -1,3 +1,5 @@
+import type { UiPrompt } from "./ui-prompt.js";
+
 export type IsoTimestamp = string;
 
 export type DaemonConfig = {
@@ -178,6 +180,10 @@ export type RemoteCompactResultEvent =
   | { type: "remote_compact_result"; requestId: string; ok: true; summary: string; firstKeptEntryId: string; tokensBefore: number }
   | { type: "remote_compact_result"; requestId: string; ok: false; message: string };
 
+export type RemoteUiPromptResultEvent =
+  | { type: "remote_ui_prompt_result"; requestId: string; promptId: string; ok: true }
+  | { type: "remote_ui_prompt_result"; requestId: string; promptId: string; ok: false; error: "ui_prompt_closed" | "invalid_ui_prompt_response" | "option_not_found" };
+
 export type TranscriptStreamEvent =
   | { type: "session_state"; state: unknown }
   | { type: "runtime_status"; status: RuntimeStatus }
@@ -189,6 +195,9 @@ export type TranscriptStreamEvent =
   | RemoteCloneResultEvent
   | RemoteSessionReplacedEvent
   | RemoteCompactResultEvent
+  | RemoteUiPromptResultEvent
+  | { type: "ui_prompt_opened"; prompt: UiPrompt }
+  | { type: "ui_prompt_closed"; promptId: string }
   | { type: "turn_start"; turnIndex: number; createdAt?: IsoTimestamp }
   | { type: "turn_end"; turnIndex: number }
   | { type: "transcript_message_start"; message: TranscriptMessage }

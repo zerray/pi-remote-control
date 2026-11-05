@@ -3,7 +3,7 @@ import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RemoteTuiCommand } from "../active-session-registry.js";
-import type { RemoteCloneResultEvent, RemoteCompactResultEvent, RemoteForkResultEvent, RemoteModelSelectResultEvent, RemoteSessionReplacedEvent, RemoteTreeNavigationResultEvent } from "../types.js";
+import type { RemoteCloneResultEvent, RemoteCompactResultEvent, RemoteForkResultEvent, RemoteModelSelectResultEvent, RemoteSessionReplacedEvent, RemoteTreeNavigationResultEvent, RemoteUiPromptResultEvent } from "../types.js";
 import { loadDaemonConfig } from "../config.js";
 import { collectModelCatalog } from "../model-catalog.js";
 import { getDaemonStateDir } from "../paths.js";
@@ -11,6 +11,7 @@ import { collectRuntimeStatus } from "../runtime-status.js";
 import { projectIdForPath } from "../session-index.js";
 import { buildTreeSnapshot } from "../tree-snapshot.js";
 import { createTranscriptEventCanonicalizer } from "./transcript-event-canonicalizer.js";
+import { __resetUiPromptBridgeForTests, answerUiPrompt, cancelUiPrompts, installUiPromptBridge, openUiPrompts, setUiPromptBridgeListener } from "./ui-prompt-bridge.js";
 
 export { collectRuntimeStatus } from "../runtime-status.js";
 
@@ -23,6 +24,7 @@ const remoteReplacementInFlightSessionIds = new Set<string>();
 const localForkRemoteControlDisabledTargetFiles = new Set<string>();
 const agentRunStates = new Map<string, { runSequence: number; terminalCompleted: boolean }>();
 const pendingAgentSettlements = new Map<string, string>();
+const uiPromptEventChains = new Map<string, Promise<void>>();
 const UNREGISTER_TUI_SESSION_TIMEOUT_MS = 5_000;
 
 export function __resetRemoteControlExtensionStateForTests(): void {
@@ -37,6 +39,8 @@ export function __resetRemoteControlExtensionStateForTests(): void {
   localForkRemoteControlDisabledTargetFiles.clear();
   agentRunStates.clear();
   pendingAgentSettlements.clear();
+  uiPromptEventChains.clear();
+  __resetUiPromptBridgeForTests();
 }
 
 export default function remoteControlExtension(pi: ExtensionAPI): void {
@@ -73,6 +77,10 @@ export default function remoteControlExtension(pi: ExtensionAPI): void {
     await unregisterTuiSession(sessionId).catch(() => undefined);
   };
 
+  setUiPromptBridgeListener({
+    opened: (sessionId, prompt) => postUiPromptEvent(sessionId, { type: "ui_prompt_opened", prompt }),
+    closed: (sessionId, promptId) => postUiPromptEvent(sessionId, { type: "ui_prompt_closed", promptId }),
+  });
   registerEventForwarders(pi, forward, cleanup, resetLocalState);
 
   pi.registerCommand("remote-control", {
@@ -85,6 +93,7 @@ export default function remoteControlExtension(pi: ExtensionAPI): void {
         return;
       }
       const sessionId = daemonSessionId(ctx);
+      installUiPromptBridge(ctx.ui, sessionId);
       if (activeSessionIds.has(sessionId)) {
         try {
           await unregisterTuiSession(sessionId);
@@ -149,6 +158,7 @@ function registerEventForwarders(
   resetLocalState: (ctx: ExtensionContext) => void,
 ): void {
   pi.on("session_start", (event, ctx) => {
+    installUiPromptBridge(ctx.ui, daemonSessionId(ctx));
     resetLocalState(ctx);
     notifyLocalForkRemoteControlDisabled(event, ctx);
   });
@@ -386,6 +396,7 @@ async function toRegistration(pi: unknown, ctx: ExtensionCommandContext): Promis
     runtimeStatus: collectRuntimeStatus(pi, ctx),
     modelCatalog: await collectModelCatalog(ctx),
     treeSnapshot: treeSnapshotForContext(ctx),
+    uiPrompts: openUiPrompts(daemonSessionId(ctx)),
     updatedAt: new Date().toISOString(),
   };
 }
@@ -480,7 +491,11 @@ export function handleRemoteCommand(
     pi.sendUserMessage(command.text, remotePromptDeliveryOptions(ctx, command.streamingBehavior));
     return;
   }
-  if (command.type === "remote_abort") ctx.abort();
+  if (command.type === "remote_abort") {
+    if (sessionId) cancelUiPrompts(sessionId);
+    ctx.abort();
+  }
+  if (command.type === "remote_ui_prompt_response") handleRemoteUiPromptResponseCommand(command, sessionId);
   if (command.type === "remote_compact") handleRemoteCompactCommand(ctx, command.requestId, sessionId);
   if (command.type === "remote_model_catalog_refresh") handleRemoteModelCatalogRefreshCommand(ctx, command.requestId, sessionId);
   if (command.type === "remote_model_select") handleRemoteModelSelectCommand(pi, ctx, command, sessionId);
@@ -488,6 +503,14 @@ export function handleRemoteCommand(
   if (command.type === "remote_tree_navigate") handleRemoteTreeNavigateCommand(ctx, command, sessionId);
   if (command.type === "remote_fork") handleRemoteForkCommand(pi, ctx, command, sessionId);
   if (command.type === "remote_clone") handleRemoteCloneCommand(pi, ctx, command, sessionId);
+}
+
+function handleRemoteUiPromptResponseCommand(command: Extract<RemoteTuiCommand, { type: "remote_ui_prompt_response" }>, sessionId: string | undefined): void {
+  if (!sessionId) return;
+  const result = answerUiPrompt(sessionId, command.promptId, command.response);
+  postUiPromptEvent(sessionId, { type: "remote_ui_prompt_result", requestId: command.requestId, promptId: command.promptId, ...result } satisfies RemoteUiPromptResultEvent);
+  // The daemon still listed a prompt this TUI no longer has; clear the stale entry.
+  if (!result.ok && result.error === "ui_prompt_closed") postUiPromptEvent(sessionId, { type: "ui_prompt_closed", promptId: command.promptId });
 }
 
 function handleRemoteModelCatalogRefreshCommand(
@@ -804,6 +827,13 @@ async function postTuiEvent(sessionId: string, event: unknown): Promise<void> {
     headers: await tuiHeaders(),
     body: JSON.stringify(event),
   });
+}
+
+// Prompt events are posted in order so a fast local answer cannot reach the daemon before its prompt.
+function postUiPromptEvent(sessionId: string, event: unknown): void {
+  if (!activeSessionIds.has(sessionId)) return;
+  const previous = uiPromptEventChains.get(sessionId) ?? Promise.resolve();
+  uiPromptEventChains.set(sessionId, previous.then(() => postTuiEvent(sessionId, event)).catch(() => undefined));
 }
 
 async function postRuntimeStatusIfChanged(pi: unknown, ctx: ExtensionContext, sessionId: string, runtimeStatusCache: Map<string, string>): Promise<void> {

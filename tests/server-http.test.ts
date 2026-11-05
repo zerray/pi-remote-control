@@ -426,6 +426,104 @@ describe("daemon HTTP server", () => {
     );
   });
 
+  it("tracks open UI prompts from the owning TUI and broadcasts their lifecycle", async () => {
+    const activeSessions = createActiveSessionRegistry();
+    const registered = { type: "register_session", id: "sess_1", piSessionId: "pi_1", project: { id: "proj_1", name: "Example", path: "/repo/example" }, sessionFile: "/tmp/session.jsonl", pid: 1234, messageCount: 0, isStreaming: true, updatedAt: "2026-05-09T00:00:00.000Z" };
+    const restored = { promptId: "uip_restored", kind: "input", title: "Branch name?", placeholder: "main", createdAt: "2026-05-09T09:46:00.000Z" };
+    const prompt = { promptId: "uip_1", kind: "select", title: "Allow rm -rf build?", options: [{ optionId: "opt_0", label: "Allow" }, { optionId: "opt_1", label: "Block" }], createdAt: "2026-05-09T09:47:00.000Z" };
+
+    await withServer(
+      async (baseUrl) => {
+        const registration = await fetch(`${baseUrl}/v1/tui/sessions`, {
+          method: "POST",
+          headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+          body: JSON.stringify({ ...registered, uiPrompts: [restored, { promptId: "uip_bad", kind: "custom", title: "x", createdAt: "2026-05-09T09:46:00.000Z" }] }),
+        });
+        expect(registration.status).toBe(200);
+
+        const webSocket = new WebSocket(`${baseUrl.replace("http://", "ws://")}/v1/sessions/sess_1/stream`, {
+          headers: { authorization: "Bearer test-token" },
+        });
+        const messages: unknown[] = [];
+        webSocket.on("message", (data) => messages.push(JSON.parse(String(data))));
+        await new Promise<void>((resolve) => webSocket.once("open", resolve));
+        await vi.waitFor(() => expect(messages).toContainEqual(expect.objectContaining({ type: "session_state", state: expect.objectContaining({ uiPrompts: [restored] }) })));
+
+        const postEvent = (event: unknown) => fetch(`${baseUrl}/v1/tui/sessions/sess_1/events`, {
+          method: "POST",
+          headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+          body: JSON.stringify(event),
+        });
+        expect((await postEvent({ type: "ui_prompt_opened", prompt: { ...prompt, extra: "dropped" } })).status).toBe(200);
+        await vi.waitFor(() => expect(messages).toContainEqual({ type: "ui_prompt_opened", prompt }));
+
+        const snapshot = await fetch(`${baseUrl}/v1/sessions/sess_1`, { headers: { authorization: "Bearer test-token" } });
+        await expect(snapshot.json()).resolves.toMatchObject({ uiPrompts: [restored, prompt] });
+
+        await postEvent({ type: "remote_ui_prompt_result", requestId: "req_1", promptId: "uip_1", ok: true });
+        await postEvent({ type: "ui_prompt_closed", promptId: "uip_1" });
+        await vi.waitFor(() => expect(messages).toContainEqual({ type: "ui_prompt_closed", promptId: "uip_1" }));
+        expect(messages).toContainEqual({ type: "remote_ui_prompt_result", requestId: "req_1", promptId: "uip_1", ok: true });
+        expect(activeSessions.getSessionState("sess_1")?.uiPrompts).toEqual([restored]);
+        webSocket.close();
+      },
+      { activeSessions, authenticateToken: (token) => token === "test-token" },
+    );
+  });
+
+  it("validates remote UI prompt responses before queueing them for the owning TUI", async () => {
+    const activeSessions = createActiveSessionRegistry();
+    activeSessions.registerSession({
+      id: "sess_1",
+      piSessionId: "pi_1",
+      project: { id: "proj_1", name: "Example", path: "/repo/example" },
+      sessionFile: "/tmp/session.jsonl",
+      pid: 1234,
+      messageCount: 0,
+      isStreaming: true,
+      uiPrompts: [
+        { promptId: "uip_select", kind: "select", title: "Allow?", options: [{ optionId: "opt_0", label: "Allow" }], createdAt: "2026-05-09T09:47:00.000Z" },
+        { promptId: "uip_editor", kind: "editor", title: "Edit plan", prefill: "draft", createdAt: "2026-05-09T09:47:00.000Z" },
+      ],
+      updatedAt: "2026-05-09T00:00:00.000Z",
+    });
+
+    await withServer(
+      async (baseUrl) => {
+        const respond = (sessionId: string, promptId: string, body: unknown, token = "test-token") => fetch(`${baseUrl}/v1/sessions/${sessionId}/ui-prompts/${promptId}/response`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const expectError = async (response: Response, status: number, error: string) => {
+          expect(response.status).toBe(status);
+          await expect(response.json()).resolves.toEqual({ error });
+        };
+
+        expect((await respond("sess_1", "uip_select", { type: "cancel" }, "wrong")).status).toBe(401);
+        await expectError(await respond("sess_missing", "uip_select", { type: "cancel" }), 409, "session_not_active");
+        await expectError(await respond("sess_1", "uip_gone", { type: "cancel" }), 409, "ui_prompt_not_found");
+        await expectError(await respond("sess_1", "uip_select", { type: "option", optionId: "opt_9" }), 409, "option_not_found");
+        await expectError(await respond("sess_1", "uip_select", { type: "text", text: "Allow" }), 400, "invalid_ui_prompt_response");
+        await expectError(await respond("sess_1", "uip_editor", { type: "text", text: "x".repeat(65_537) }), 400, "invalid_ui_prompt_response");
+        await expectError(await respond("sess_1", "uip_editor", { type: "bogus" }), 400, "invalid_ui_prompt_response");
+        expect(activeSessions.takeCommands("sess_1")).toEqual([]);
+
+        const accepted = await respond("sess_1", "uip_select", { type: "option", optionId: "opt_0", extra: true });
+        expect(accepted.status).toBe(200);
+        const acceptedBody = await accepted.json() as { requestId: string };
+        expect(acceptedBody).toEqual({ accepted: true, requestId: expect.stringMatching(/^req_/) });
+        const editorAccepted = await respond("sess_1", "uip_editor", { type: "text", text: "final plan" });
+        const editorBody = await editorAccepted.json() as { requestId: string };
+        expect(activeSessions.takeCommands("sess_1")).toEqual([
+          { type: "remote_ui_prompt_response", requestId: acceptedBody.requestId, promptId: "uip_select", response: { type: "option", optionId: "opt_0" } },
+          { type: "remote_ui_prompt_response", requestId: editorBody.requestId, promptId: "uip_editor", response: { type: "text", text: "final plan" } },
+        ]);
+      },
+      { activeSessions, authenticateToken: (token) => token === "test-token" },
+    );
+  });
+
   it("caches and broadcasts a refreshed Model Catalog Snapshot from the owning TUI", async () => {
     const activeSessions = createActiveSessionRegistry();
     activeSessions.registerSession({

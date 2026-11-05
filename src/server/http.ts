@@ -12,7 +12,8 @@ import {
 } from "../transcript-pagination.js";
 import { INITIAL_WEBSOCKET_SESSION_MESSAGE_LIMIT, previewInitialSessionState } from "../transcript-preview.js";
 import { normalizeTuiEvent } from "../transcript-stream.js";
-import type { AgentSettlement, DaemonConfig, DevicePushRoute, RemoteCloneResultEvent, RemoteCompactResultEvent, RemoteForkResultEvent, RemoteModelCatalogEvent, RemoteModelSelectResultEvent, RemoteModelSummary, RemoteSessionReplacedEvent, RemoteTreeNavigationResultEvent, RemoteTreeSnapshotEvent, RuntimeStatus } from "../types.js";
+import { parseUiPromptResponse, reduceUiPrompt, validateUiPromptResponse, type UiPrompt } from "../ui-prompt.js";
+import type { AgentSettlement, DaemonConfig, DevicePushRoute, RemoteCloneResultEvent, RemoteCompactResultEvent, RemoteForkResultEvent, RemoteModelCatalogEvent, RemoteModelSelectResultEvent, RemoteModelSummary, RemoteSessionReplacedEvent, RemoteTreeNavigationResultEvent, RemoteTreeSnapshotEvent, RemoteUiPromptResultEvent, RuntimeStatus } from "../types.js";
 
 export type RemoteSessionSummary = {
   id: string;
@@ -210,13 +211,17 @@ async function handleHttpRequest(
       return;
     }
     const rawBody = (await readJsonBody(request)) as Record<string, unknown>;
-    const { modelCatalog: rawModelCatalog, ...registrationFields } = rawBody;
+    const { modelCatalog: rawModelCatalog, uiPrompts: rawUiPrompts, ...registrationFields } = rawBody;
     const modelCatalog = rawModelCatalog === undefined
       ? undefined
       : reducedRemoteModelCatalogEvent({ type: "remote_model_catalog", catalog: rawModelCatalog })?.catalog;
+    const uiPrompts = Array.isArray(rawUiPrompts)
+      ? rawUiPrompts.map(reduceUiPrompt).filter((prompt): prompt is UiPrompt => prompt !== undefined)
+      : [];
     const body = {
       ...registrationFields,
       ...(modelCatalog ? { modelCatalog } : {}),
+      uiPrompts,
     } as Parameters<ActiveSessionRegistry["registerSession"]>[0];
     const session = options.activeSessions?.registerSession(body);
     writeJson(response, session ? 200 : 503, session ? { session } : { error: "active_sessions_unavailable" });
@@ -286,6 +291,21 @@ async function handleHttpRequest(
     const modelSelectResultEvent = reducedRemoteModelSelectResultEvent(event);
     if (modelSelectResultEvent) {
       streamHub.get(sessionId)?.forEach((webSocket) => sendWebSocketJson(webSocket, modelSelectResultEvent));
+      writeJson(response, 200, { accepted: true });
+      return;
+    }
+    const uiPromptEvent = reducedUiPromptLifecycleEvent(event);
+    if (uiPromptEvent) {
+      const changed = uiPromptEvent.type === "ui_prompt_opened"
+        ? options.activeSessions?.openUiPrompt(sessionId, uiPromptEvent.prompt) ?? false
+        : options.activeSessions?.closeUiPrompt(sessionId, uiPromptEvent.promptId) ?? false;
+      if (changed) streamHub.get(sessionId)?.forEach((webSocket) => sendWebSocketJson(webSocket, uiPromptEvent));
+      writeJson(response, 200, { accepted: true });
+      return;
+    }
+    const uiPromptResultEvent = reducedRemoteUiPromptResultEvent(event);
+    if (uiPromptResultEvent) {
+      streamHub.get(sessionId)?.forEach((webSocket) => sendWebSocketJson(webSocket, uiPromptResultEvent));
       writeJson(response, 200, { accepted: true });
       return;
     }
@@ -479,6 +499,38 @@ async function handleHttpRequest(
     }
     const requestId = nextRequestId();
     if (!options.activeSessions?.enqueueCommand(sessionId, { type: "remote_model_select", requestId, provider, modelId, baseCatalogVersion })) {
+      writeJson(response, 409, { error: "session_not_active" });
+      return;
+    }
+    writeJson(response, 200, { accepted: true, requestId });
+    return;
+  }
+
+  const uiPromptResponseMatch = pathname.match(/^\/v1\/sessions\/([^/]+)\/ui-prompts\/([^/]+)\/response$/);
+  if (request.method === "POST" && uiPromptResponseMatch) {
+    if (!(await isAuthorized(request, options))) {
+      writeJson(response, 401, { error: "unauthorized" });
+      return;
+    }
+    const sessionId = decodeURIComponent(uiPromptResponseMatch[1] ?? "");
+    const promptId = decodeURIComponent(uiPromptResponseMatch[2] ?? "");
+    if (!options.activeSessions?.getSessionState(sessionId, { messageLimit: 1 })) {
+      writeJson(response, 409, { error: "session_not_active" });
+      return;
+    }
+    const prompt = options.activeSessions.getUiPrompt(sessionId, promptId);
+    if (!prompt) {
+      writeJson(response, 409, { error: "ui_prompt_not_found" });
+      return;
+    }
+    const uiPromptResponse = parseUiPromptResponse(await readJsonBody(request));
+    const error = uiPromptResponse ? validateUiPromptResponse(prompt, uiPromptResponse) : "invalid_ui_prompt_response";
+    if (!uiPromptResponse || error) {
+      writeJson(response, error === "option_not_found" ? 409 : 400, { error });
+      return;
+    }
+    const requestId = nextRequestId();
+    if (!options.activeSessions.enqueueCommand(sessionId, { type: "remote_ui_prompt_response", requestId, promptId, response: uiPromptResponse })) {
       writeJson(response, 409, { error: "session_not_active" });
       return;
     }
@@ -952,6 +1004,25 @@ function reducedRemoteModelSelectResultEvent(event: unknown): RemoteModelSelectR
   const errors = new Set(["session_busy", "model_catalog_changed", "model_not_found", "model_unavailable", "selection_failed"]);
   if (record.ok !== false || typeof record.error !== "string" || !errors.has(record.error)) return undefined;
   return { type: "remote_model_select_result", requestId: record.requestId, ok: false, error: record.error as Extract<RemoteModelSelectResultEvent, { ok: false }>["error"] };
+}
+
+function reducedUiPromptLifecycleEvent(event: unknown): { type: "ui_prompt_opened"; prompt: UiPrompt } | { type: "ui_prompt_closed"; promptId: string } | undefined {
+  if (!event || typeof event !== "object") return undefined;
+  const record = event as Record<string, unknown>;
+  if (record.type === "ui_prompt_closed") return typeof record.promptId === "string" ? { type: "ui_prompt_closed", promptId: record.promptId } : undefined;
+  if (record.type !== "ui_prompt_opened") return undefined;
+  const prompt = reduceUiPrompt(record.prompt);
+  return prompt ? { type: "ui_prompt_opened", prompt } : undefined;
+}
+
+function reducedRemoteUiPromptResultEvent(event: unknown): RemoteUiPromptResultEvent | undefined {
+  if (!event || typeof event !== "object") return undefined;
+  const record = event as Record<string, unknown>;
+  if (record.type !== "remote_ui_prompt_result" || typeof record.requestId !== "string" || typeof record.promptId !== "string") return undefined;
+  if (record.ok === true) return { type: "remote_ui_prompt_result", requestId: record.requestId, promptId: record.promptId, ok: true };
+  const errors = new Set(["ui_prompt_closed", "invalid_ui_prompt_response", "option_not_found"]);
+  if (record.ok !== false || typeof record.error !== "string" || !errors.has(record.error)) return undefined;
+  return { type: "remote_ui_prompt_result", requestId: record.requestId, promptId: record.promptId, ok: false, error: record.error as Extract<RemoteUiPromptResultEvent, { ok: false }>["error"] };
 }
 
 function isRuntimeStatusEvent(event: unknown): event is { type: "runtime_status"; status: RuntimeStatus } {

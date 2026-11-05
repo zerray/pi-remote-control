@@ -8,6 +8,10 @@ Glossary for the Pi Remote Control domain.
 A native iOS session-tree navigation flow where the app chooses a target session entry and the owning Pi TUI extension performs the navigation in the live session.
 _Avoid_: Remote `/tree`, slash-command passthrough
 
+**UI Prompt**:
+A blocking extension dialog (`select`, `confirm`, `input`, or `editor`) open in the owning TUI, published in reduced form so iOS can answer it with a validated remote response.
+_Avoid_: Dialog passthrough, remote custom UI
+
 **Tree Filter**:
 A named view over a session tree that controls which kinds of entries are shown while preserving the same underlying tree and navigation targets.
 _Avoid_: Tree mode, entry mode

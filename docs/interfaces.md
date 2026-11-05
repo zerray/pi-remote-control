@@ -543,6 +543,52 @@ Response:
 
 The final outcome arrives as `remote_clone_result`. On success, the old session stream also receives `remote_session_replaced` with the new active session summary.
 
+### Remote UI prompts
+
+Extensions running in the owning TUI can block on `ctx.ui.select()`, `ctx.ui.confirm()`, `ctx.ui.input()`, and `ctx.ui.editor()`. While remote control is active, the extension publishes each open prompt as a reduced UI Prompt and accepts one validated remote response per prompt. `ctx.ui.custom()` components have no serializable shape and are not published.
+
+UI Prompt:
+
+```json
+{
+  "promptId": "uip_...",
+  "kind": "select",
+  "title": "Allow `rm -rf build`?",
+  "options": [
+    { "optionId": "opt_0", "label": "Allow" },
+    { "optionId": "opt_1", "label": "Block" }
+  ],
+  "createdAt": "2026-05-09T09:47:00.000Z"
+}
+```
+
+`kind` is `select`, `confirm`, `input`, or `editor`. `options` is present only for `select`; `message` only for `confirm`; `placeholder` only for `input`; `prefill` only for `editor`. `promptId` and `optionId` values are opaque. Display strings (`title`, `message`, `placeholder`, option `label`) are capped at 4,000 characters, `select` prompts publish at most 200 options, and a prompt that was clipped carries `truncated: true`. Editor prompts whose `prefill` exceeds 65,536 characters are not published because a remote answer could not preserve the full text.
+
+Open prompts appear in every `session_state` as `state.uiPrompts`, ordered oldest first. The last entry is the prompt the TUI currently shows. Live changes arrive as `ui_prompt_opened` and `ui_prompt_closed` stream events.
+
+`POST /v1/sessions/{sessionId}/ui-prompts/{promptId}/response`
+
+Request bodies, by prompt kind:
+
+```json
+{ "type": "option", "optionId": "opt_1" }
+{ "type": "confirm", "confirmed": true }
+{ "type": "text", "text": "release notes..." }
+{ "type": "cancel" }
+```
+
+`option` answers `select`, `confirm` answers `confirm`, and `text` answers `input` or `editor` with at most 65,536 characters. `cancel` dismisses any kind, matching a local Escape: `select`, `input`, and `editor` resolve to no value and `confirm` resolves to `false`.
+
+Response:
+
+```json
+{ "accepted": true, "requestId": "req_..." }
+```
+
+The daemon rejects `409 session_not_active`, `409 ui_prompt_not_found` when the prompt is no longer open, `409 option_not_found` for an option the prompt did not publish, and `400 invalid_ui_prompt_response` for a response type that does not match the prompt kind or text that exceeds the limit. Free text is never accepted for `select` or `confirm`. Unlike model selection, UI prompt responses are accepted while the agent is streaming, because extension prompts usually block an active run. The response is delivered to the owning TUI over the command channel and resolves the waiting extension call directly; it is not delivered as a chat message.
+
+The final outcome arrives as `remote_ui_prompt_result`. A prompt answered locally first, dismissed by its timeout or signal, or cancelled by abort reports `ui_prompt_closed`; the TUI re-validates the response and can also report `invalid_ui_prompt_response` or `option_not_found`. Remote abort also cancels every open UI Prompt in that session. When a remote answer wins, the TUI dismisses its local `select`, `confirm`, or `input` dialog; Pi gives `editor` no dismissal signal, so a local editor stays open after a remote answer and its later local result is ignored.
+
 ### Session stream
 
 `GET /v1/sessions/{sessionId}/stream` upgrades to WebSocket.
@@ -577,7 +623,8 @@ Initial state:
     "tools": [],
     "isStreaming": false,
     "pendingMessageCount": 0,
-    "runtimeStatus": null
+    "runtimeStatus": null,
+    "uiPrompts": []
   }
 }
 ```
@@ -635,6 +682,17 @@ Remote compact result events:
 ```
 
 The daemon sends `remote_compact_result` when the owning TUI extension reports completion or failure for a prior `remote_compact` command. Clients correlate the result with the `requestId` returned by `POST /v1/sessions/{sessionId}/compact`. Compact results are live stream events and are not included in HTTP session snapshots.
+
+UI prompt events:
+
+```json
+{ "type": "ui_prompt_opened", "prompt": { "promptId": "uip_...", "kind": "confirm", "title": "Push to origin?", "message": "3 commits", "createdAt": "2026-05-09T09:47:00.000Z" } }
+{ "type": "ui_prompt_closed", "promptId": "uip_..." }
+{ "type": "remote_ui_prompt_result", "requestId": "req_...", "promptId": "uip_...", "ok": true }
+{ "type": "remote_ui_prompt_result", "requestId": "req_...", "promptId": "uip_...", "ok": false, "error": "ui_prompt_closed" }
+```
+
+`ui_prompt_opened` appends to the session's open prompts and `ui_prompt_closed` removes one, whichever side answered it. `session_state.state.uiPrompts` replaces the whole list. Prompt titles and other display strings are extension-authored and can contain commands, paths, or model output; clients must not copy them into notifications.
 
 Tree and session replacement events:
 
@@ -733,6 +791,8 @@ Tree snapshots are posted as `{ "type": "tree_snapshot", "requestId": "req_...",
 
 Model catalogs are posted as `{ "type": "remote_model_catalog", "requestId": "req_...", "catalog": ModelCatalogSnapshot }`; the daemon replaces its active-session cache and broadcasts the public event. Model-selection outcomes are posted as `{ "type": "remote_model_select_result", "requestId": "req_...", "ok": true, "model": RemoteModelSummary, "catalogVersion": "modelsv_..." }` or a failure with a stable `error`.
 
+UI Prompts are posted as `{ "type": "ui_prompt_opened", "prompt": UiPrompt }` and `{ "type": "ui_prompt_closed", "promptId": "uip_..." }`, in order per session. The daemon re-reduces each prompt with the public bounds, stores open prompts in active-session process memory, and broadcasts the public events. Registration includes `uiPrompts` with every prompt still open in the TUI, so heartbeat re-registration restores prompts the daemon lost. Response outcomes are posted with the public `remote_ui_prompt_result` shape. A response for a prompt the TUI no longer has is answered with `ui_prompt_closed` and a fresh `ui_prompt_closed` event, which clears any stale daemon entry.
+
 Agent Settlement is posted as `{ "type": "agent_settled", "settlementId": "settle_..." }`. The ID is stable for duplicate delivery of the same settled run. The extension emits it only after at least one agent run and does not treat a terminal aborted or error outcome as completed work. The daemon uses it for push idempotency and does not expose it as transcript content.
 
 Remote compact results are posted as `{ "type": "remote_compact_result", "requestId": "req_...", "ok": true, "summary": "...", "firstKeptEntryId": "entry_...", "tokensBefore": 12345 }` or `{ "type": "remote_compact_result", "requestId": "req_...", "ok": false, "message": "..." }`; the daemon broadcasts the public `remote_compact_result` WebSocket event without storing it durably. Tree navigation, fork, clone, and session-replacement results are posted with the public result shapes described in the session stream section.
@@ -751,9 +811,10 @@ The daemon forwards iOS requests to the owning TUI extension:
 { "type": "remote_tree_navigate", "requestId": "req_...", "targetEntryId": "entry_...", "baseSnapshotVersion": "treev_...", "baseBranchVersion": "branchv_...", "baseLeafId": "entry_current_or_null", "summaryMode": "default" }
 { "type": "remote_fork", "requestId": "req_...", "targetEntryId": "entry_...", "baseSnapshotVersion": "treev_...", "baseBranchVersion": "branchv_...", "baseLeafId": "entry_current_or_null" }
 { "type": "remote_clone", "requestId": "req_...", "baseSnapshotVersion": "treev_...", "baseBranchVersion": "branchv_...", "baseLeafId": "entry_current_or_null" }
+{ "type": "remote_ui_prompt_response", "requestId": "req_...", "promptId": "uip_...", "response": { "type": "option", "optionId": "opt_1" } }
 ```
 
-Prompt and abort command acknowledgements are not part of the current MVP protocol. Compact, model refresh, model selection, tree navigation, fork, and clone completion are reported asynchronously through their corresponding WebSocket result events. Tree refresh completion is reported through `remote_tree_snapshot`.
+Prompt and abort command acknowledgements are not part of the current MVP protocol. `remote_abort` also cancels every open UI Prompt in the session before aborting the agent. Compact, model refresh, model selection, tree navigation, fork, clone, and UI prompt response completion are reported asynchronously through their corresponding WebSocket result events. Tree refresh completion is reported through `remote_tree_snapshot`.
 
 ## Pi integration boundary
 
@@ -769,6 +830,7 @@ The daemon keeps Pi-specific transport details inside the package. Pi SDK/RPC is
 | Compact | iOS → daemon → owning TUI extension → Pi extension API `ctx.compact()` → TUI-reported `remote_compact_result` → iOS WebSocket. |
 | Model catalog | Owning TUI model registry → reduced Model Catalog Snapshot → daemon process cache → iOS HTTP/WebSocket. |
 | Select model | iOS → daemon stale/busy guard → owning TUI extension → Pi extension API `pi.setModel(...)` → selection result and Runtime Status → iOS WebSocket. |
+| Answer UI prompt | Extension `ctx.ui` dialog → owning TUI extension UI Prompt → daemon process cache → iOS; iOS response → daemon kind/option validation → owning TUI extension resolves the waiting dialog call → `remote_ui_prompt_result` and `ui_prompt_closed` → iOS WebSocket. |
 | Completion push | Pi `agent_settled` → owning TUI extension Agent Settlement → daemon Push Route → central Push Gateway → APNs. |
 | Tree refresh | iOS → daemon → owning TUI extension → TUI-reported `TreeSnapshot` → daemon cache → iOS WebSocket. |
 | Tree navigation | iOS → daemon → owning TUI extension → Pi extension API `ctx.navigateTree()` → TUI-reported navigation result and tree snapshot → daemon branch-aware state/session refresh → iOS WebSocket. |
