@@ -1,4 +1,5 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import WebSocket from "ws";
@@ -55,6 +56,46 @@ describe("daemon HTTP server", () => {
         piVersion: "pi-test",
         daemonVersion: "daemon-test",
       });
+    });
+  });
+
+  it("survives a client aborting a request mid-body", async () => {
+    await withServer(async (baseUrl) => {
+      const url = new URL(baseUrl);
+      await new Promise<void>((resolve) => {
+        const req = httpRequest({
+          host: url.hostname,
+          port: Number(url.port),
+          path: "/v1/tui/sessions",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": "1000" },
+        });
+        req.on("error", () => resolve());
+        req.write('{"deviceName":"x"');
+        setTimeout(() => {
+          req.destroy();
+          resolve();
+        }, 50);
+      });
+
+      const response = await fetch(`${baseUrl}/v1/health`);
+      expect(response.status).toBe(200);
+    });
+  });
+
+  it("rejects malformed JSON without crashing", async () => {
+    await withServer(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/v1/tui/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "not-json",
+      });
+
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toEqual({ error: "invalid_json" });
+
+      const health = await fetch(`${baseUrl}/v1/health`);
+      expect(health.status).toBe(200);
     });
   });
 

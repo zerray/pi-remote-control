@@ -135,12 +135,39 @@ export async function startDaemonServer(options: StartServerOptions): Promise<Da
 
 function createHttpServer(options: StartServerOptions, streamHub: StreamHub, webSockets: WebSocketServer): Server {
   const server = createServer((request, response) => {
-    void handleHttpRequest(request, response, options, streamHub);
+    void handleHttpRequest(request, response, options, streamHub).catch((error: unknown) => {
+      handleHttpRequestFailure(error, response);
+    });
   });
   server.on("upgrade", (request, socket, head) => {
-    void handleUpgrade(request, socket, head, webSockets, options, streamHub);
+    void handleUpgrade(request, socket, head, webSockets, options, streamHub).catch(() => {
+      socket.destroy();
+    });
   });
   return server;
+}
+
+// A long-running daemon must survive misbehaving clients: an aborted request or a
+// malformed body rejects `handleHttpRequest`, and an unhandled rejection would
+// terminate the whole process (Node's default for unhandled rejections).
+function handleHttpRequestFailure(error: unknown, response: ServerResponse): void {
+  if (response.headersSent || response.writableEnded || response.destroyed) return;
+  if (error instanceof InvalidJsonBodyError) {
+    writeJson(response, 400, { error: "invalid_json" });
+    return;
+  }
+  if (isClientAbortError(error)) {
+    response.destroy();
+    return;
+  }
+  writeJson(response, 500, { error: "internal_error" });
+}
+
+function isClientAbortError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.message === "aborted"
+    || (error as NodeJS.ErrnoException).code === "ECONNRESET"
+    || (error as NodeJS.ErrnoException).code === "ERR_STREAM_PREMATURE_CLOSE";
 }
 
 async function listen(server: Server, host: string, port: number): Promise<void> {
@@ -847,8 +874,11 @@ async function handleUpgrade(
     const activeState = options.activeSessions?.getSessionState(sessionId, { messageLimit: INITIAL_WEBSOCKET_SESSION_MESSAGE_LIMIT });
     if (activeState) sendWebSocketJson(webSocket, { type: "session_state", state: previewInitialSessionState(activeState) });
 
-    void options.sessionService?.streamSession?.(sessionId, (event) => {
+    const stream = options.sessionService?.streamSession?.(sessionId, (event) => {
       sendWebSocketJson(webSocket, event);
+    });
+    void stream?.catch(() => {
+      if (webSocket.readyState !== WebSocket.CLOSED) webSocket.terminate();
     });
   });
 }
@@ -1035,10 +1065,22 @@ function isWildcardHost(host: string): boolean {
   return host === "0.0.0.0" || host === "::" || host === "[::]" || host === "";
 }
 
+class InvalidJsonBodyError extends Error {
+  constructor() {
+    super("invalid_json_body");
+    this.name = "InvalidJsonBodyError";
+  }
+}
+
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   let body = "";
   for await (const chunk of request) body += String(chunk);
-  return body ? JSON.parse(body) : {};
+  if (!body) return {};
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new InvalidJsonBodyError();
+  }
 }
 
 function writeJson(response: ServerResponse, status: number, body: unknown): void {
