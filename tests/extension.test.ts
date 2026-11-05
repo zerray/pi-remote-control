@@ -1505,6 +1505,90 @@ describe("remote control extension", () => {
       expect(registrations[0]?.uiPrompts).toEqual([{ promptId: expect.stringMatching(/^uip_/), kind: "input", title: "Ticket id", placeholder: "PI-123", createdAt: expect.any(String) }]);
       expect(promptEvents()).toEqual([]);
     });
+
+    function recordFetchDuringRegistration(onRegister: () => Promise<void>) {
+      const events: Array<Record<string, unknown>> = [];
+      vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+        const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
+        if (url.endsWith("/v1/tui/sessions") && body) await onRegister();
+        if (url.endsWith("/events") && body) events.push(body);
+        return new Response(JSON.stringify({ session: { id: "sess_pi_1" }, commands: [] }), { status: 200 });
+      }));
+      return () => events.filter((event) => String(event.type).includes("ui_prompt"));
+    }
+
+    it("publishes a prompt that opens while the registration is in flight", async () => {
+      const { pi, commands, handlers } = createFakePi();
+      const { ctx } = createContext();
+      Object.assign(ctx.ui, { confirm: dismissibleDialog() });
+      remoteControlExtension(pi as never);
+      handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+      const promptEvents = recordFetchDuringRegistration(async () => {
+        void (ctx.ui as unknown as DialogUi).confirm("Push?", "3 commits");
+      });
+
+      await commands.find((command) => command.name === "remote-control")!.handler("", ctx);
+
+      await vi.waitFor(() => expect(promptEvents()).toEqual([
+        { type: "ui_prompt_opened", prompt: { promptId: expect.stringMatching(/^uip_/), kind: "confirm", title: "Push?", message: "3 commits", createdAt: expect.any(String) } },
+      ]));
+    });
+
+    it("closes a registered prompt that was answered locally while the registration was in flight", async () => {
+      const { pi, commands, handlers } = createFakePi();
+      const { ctx } = createContext();
+      let answerLocally!: (value: string) => void;
+      Object.assign(ctx.ui, { input: vi.fn(() => new Promise((resolve) => { answerLocally = resolve; })) });
+      remoteControlExtension(pi as never);
+      handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+      const answer = (ctx.ui as unknown as DialogUi).input("Ticket id");
+      const promptEvents = recordFetchDuringRegistration(async () => {
+        answerLocally("PI-7");
+        await answer;
+      });
+
+      await commands.find((command) => command.name === "remote-control")!.handler("", ctx);
+
+      await vi.waitFor(() => expect(promptEvents()).toEqual([{ type: "ui_prompt_closed", promptId: expect.stringMatching(/^uip_/) }]));
+    });
+
+    it("publishes a prompt that opens while a heartbeat re-registration is in flight", async () => {
+      vi.useFakeTimers();
+      const { pi, commands } = createFakePi();
+      const { ctx } = createContext();
+      Object.assign(ctx.ui, { confirm: dismissibleDialog() });
+      remoteControlExtension(pi as never);
+      let registrations = 0;
+      let daemonKnowsSession = false;
+      let rejectedEventArrived!: () => void;
+      const rejectedEvent = new Promise<void>((resolve) => { rejectedEventArrived = resolve; });
+      const deliveredEvents: Array<Record<string, unknown>> = [];
+      vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+        const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
+        if (url.endsWith("/v1/tui/sessions") && ++registrations === 2) {
+          // The prompt opens after the snapshot and its event reaches the daemon before the registration does.
+          void (ctx.ui as unknown as DialogUi).confirm("Push?", "3 commits");
+          await rejectedEvent;
+        }
+        if (url.endsWith("/v1/tui/sessions")) daemonKnowsSession = true;
+        if (url.endsWith("/events") && !daemonKnowsSession) {
+          rejectedEventArrived();
+          return new Response(JSON.stringify({ error: "session_not_found" }), { status: 404 });
+        }
+        if (url.endsWith("/events") && body) deliveredEvents.push(body);
+        if (url.endsWith("/commands") && registrations === 1) {
+          daemonKnowsSession = false;
+          return new Response(JSON.stringify({ error: "session_not_found" }), { status: 404 });
+        }
+        return new Response(JSON.stringify({ session: { id: "sess_pi_1" }, commands: [] }), { status: 200 });
+      }));
+
+      await commands.find((command) => command.name === "remote-control")!.handler("", ctx);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(registrations).toBe(2);
+      expect(deliveredEvents).toEqual([{ type: "ui_prompt_opened", prompt: expect.objectContaining({ kind: "confirm", title: "Push?" }) }]);
+    });
   });
 
   it("runs local pairing command from remote-control-pair", async () => {

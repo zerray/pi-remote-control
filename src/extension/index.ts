@@ -3,6 +3,7 @@ import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RemoteTuiCommand } from "../active-session-registry.js";
+import type { UiPrompt } from "../ui-prompt.js";
 import type { RemoteCloneResultEvent, RemoteCompactResultEvent, RemoteForkResultEvent, RemoteModelSelectResultEvent, RemoteSessionReplacedEvent, RemoteTreeNavigationResultEvent, RemoteUiPromptResultEvent } from "../types.js";
 import { loadDaemonConfig } from "../config.js";
 import { collectModelCatalog } from "../model-catalog.js";
@@ -112,11 +113,13 @@ export default function remoteControlExtension(pi: ExtensionAPI): void {
       }
 
       let response: Response;
+      let registration: Awaited<ReturnType<typeof toRegistration>>;
       try {
+        registration = await toRegistration(pi, ctx);
         response = await fetch(`${await daemonBaseUrl()}/v1/tui/sessions`, {
           method: "POST",
           headers: await tuiHeaders(),
-          body: JSON.stringify(await toRegistration(pi, ctx)),
+          body: JSON.stringify(registration),
         });
       } catch (error) {
         ctx.ui.notify(`Remote control enable failed: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -128,6 +131,7 @@ export default function remoteControlExtension(pi: ExtensionAPI): void {
       }
       runtimeStatusCache.set(sessionId, comparableRuntimeStatus(collectRuntimeStatus(pi, ctx)));
       activateLocalSession(pi, ctx, sessionId, activeSessionIds, pollTimers, runtimeStatusCache);
+      postUiPromptChangesSince(sessionId, registration.uiPrompts);
       ctx.ui.notify("Remote control enabled for this session", "info");
     },
   });
@@ -379,7 +383,7 @@ async function delay(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function toRegistration(pi: unknown, ctx: ExtensionCommandContext): Promise<unknown> {
+async function toRegistration(pi: unknown, ctx: ExtensionCommandContext) {
   const cwd = ctx.cwd;
   const piSessionId = ctx.sessionManager.getSessionId();
   const sessionFile = ctx.sessionManager.getSessionFile() ?? "";
@@ -451,11 +455,13 @@ async function reRegisterTuiSessionAfterHeartbeatMiss(
   if (!activeSessionIds.has(sessionId)) return;
 
   let response: Response;
+  let registration: Awaited<ReturnType<typeof toRegistration>>;
   try {
+    registration = await toRegistration(pi, ctx);
     response = await fetch(`${await daemonBaseUrl()}/v1/tui/sessions`, {
       method: "POST",
       headers: await tuiHeaders(),
-      body: JSON.stringify(await toRegistration(pi, ctx)),
+      body: JSON.stringify(registration),
     });
   } catch {
     disconnectLocalSession(ctx, sessionId, activeSessionIds, pollTimers);
@@ -464,6 +470,7 @@ async function reRegisterTuiSessionAfterHeartbeatMiss(
 
   if (response.ok) {
     runtimeStatusCache.set(sessionId, comparableRuntimeStatus(collectRuntimeStatus(pi, ctx)));
+    postUiPromptChangesSince(sessionId, registration.uiPrompts);
     void postPendingAgentSettlement(sessionId);
     return;
   }
@@ -834,6 +841,16 @@ function postUiPromptEvent(sessionId: string, event: unknown): void {
   if (!activeSessionIds.has(sessionId)) return;
   const previous = uiPromptEventChains.get(sessionId) ?? Promise.resolve();
   uiPromptEventChains.set(sessionId, previous.then(() => postTuiEvent(sessionId, event)).catch(() => undefined));
+}
+
+// Prompts can open or close while a registration is in flight. Their events are dropped before the session is active
+// locally or registered in the daemon, so reconcile the registered snapshot once both are true.
+function postUiPromptChangesSince(sessionId: string, registered: readonly UiPrompt[]): void {
+  const open = openUiPrompts(sessionId);
+  const openIds = new Set(open.map((prompt) => prompt.promptId));
+  const registeredIds = new Set(registered.map((prompt) => prompt.promptId));
+  for (const prompt of registered) if (!openIds.has(prompt.promptId)) postUiPromptEvent(sessionId, { type: "ui_prompt_closed", promptId: prompt.promptId });
+  for (const prompt of open) if (!registeredIds.has(prompt.promptId)) postUiPromptEvent(sessionId, { type: "ui_prompt_opened", prompt });
 }
 
 async function postRuntimeStatusIfChanged(pi: unknown, ctx: ExtensionContext, sessionId: string, runtimeStatusCache: Map<string, string>): Promise<void> {
