@@ -20,7 +20,11 @@ The daemon keeps open UI Prompts as active-session process state, includes them 
 
 Remote answering is on whenever remote control is active for the session; it needs no separate opt-in.
 
+Issue #11 proposed `POST /v1/sessions/{id}/ui-prompt` with a `basePromptVersion` and a `ui_prompt_changed` rejection. This design drops the version. A dialog's title and options are fixed when the extension calls it, so a prompt never changes in place, and every call gets a new prompt ID that is never reused. The prompt ID already names one exact prompt: an answer to a prompt that has since closed is rejected as `ui_prompt_not_found` by the daemon or `ui_prompt_closed` by the TUI. Because several prompts can be open at once, the endpoint addresses the prompt in its path, `POST /v1/sessions/{id}/ui-prompts/{promptId}/response`, instead of targeting a single current prompt.
+
 `ctx.ui.custom()` components are not published because they have no serializable shape. Extensions that want remote answers use the four supported dialogs. Pi's `editor` takes no dismissal signal, so after a remote answer the local editor stays open and its later local result is ignored. Editor prompts whose prefill exceeds the response limit are not published, because a remote answer could not preserve the full text.
+
+Issue #11 also proposed that the daemon surface a "waiting on a terminal-only prompt" status for dialogs that cannot be published. This change does not build it. A session blocked on `ctx.ui.custom()` or on an unpublished editor prompt shows on iOS as a running session with no prompt card. Such a status would be an addition, not a replacement for remote answering: the bridge could wrap `custom()` to publish a non-answerable prompt marker.
 
 # Consequences
 

@@ -26,7 +26,10 @@ export type UiPromptResponse =
   | { type: "text"; text: string }
   | { type: "cancel" };
 
-export type UiPromptResponseError = "invalid_ui_prompt_response" | "option_not_found";
+// Every error a remote UI prompt response can report; the TUI adds `ui_prompt_closed` when the dialog is already gone.
+export const UI_PROMPT_ANSWER_ERRORS = ["ui_prompt_closed", "invalid_ui_prompt_response", "option_not_found"] as const;
+export type UiPromptAnswerError = (typeof UI_PROMPT_ANSWER_ERRORS)[number];
+export type UiPromptResponseError = Exclude<UiPromptAnswerError, "ui_prompt_closed">;
 
 export type UiPromptSpec =
   | { kind: "select"; title: unknown; options: unknown }

@@ -12,8 +12,8 @@ import {
 } from "../transcript-pagination.js";
 import { INITIAL_WEBSOCKET_SESSION_MESSAGE_LIMIT, previewInitialSessionState } from "../transcript-preview.js";
 import { normalizeTuiEvent } from "../transcript-stream.js";
-import { parseUiPromptResponse, reduceUiPrompt, validateUiPromptResponse, type UiPrompt } from "../ui-prompt.js";
-import type { AgentSettlement, DaemonConfig, DevicePushRoute, RemoteCloneResultEvent, RemoteCompactResultEvent, RemoteForkResultEvent, RemoteModelCatalogEvent, RemoteModelSelectResultEvent, RemoteModelSummary, RemoteSessionReplacedEvent, RemoteTreeNavigationResultEvent, RemoteTreeSnapshotEvent, RemoteUiPromptResultEvent, RuntimeStatus } from "../types.js";
+import { parseUiPromptResponse, reduceUiPrompt, UI_PROMPT_ANSWER_ERRORS, validateUiPromptResponse, type UiPrompt } from "../ui-prompt.js";
+import type { AgentSettlement, DaemonConfig, DevicePushRoute, RemoteCloneResultEvent, RemoteCompactResultEvent, RemoteForkResultEvent, RemoteModelCatalogEvent, RemoteModelSelectResultEvent, RemoteModelSummary, RemoteSessionReplacedEvent, RemoteTreeNavigationResultEvent, RemoteTreeSnapshotEvent, RemoteUiPromptResultEvent, RuntimeStatus, UiPromptLifecycleEvent } from "../types.js";
 
 export type RemoteSessionSummary = {
   id: string;
@@ -1006,7 +1006,7 @@ function reducedRemoteModelSelectResultEvent(event: unknown): RemoteModelSelectR
   return { type: "remote_model_select_result", requestId: record.requestId, ok: false, error: record.error as Extract<RemoteModelSelectResultEvent, { ok: false }>["error"] };
 }
 
-function reducedUiPromptLifecycleEvent(event: unknown): { type: "ui_prompt_opened"; prompt: UiPrompt } | { type: "ui_prompt_closed"; promptId: string } | undefined {
+function reducedUiPromptLifecycleEvent(event: unknown): UiPromptLifecycleEvent | undefined {
   if (!event || typeof event !== "object") return undefined;
   const record = event as Record<string, unknown>;
   if (record.type === "ui_prompt_closed") return typeof record.promptId === "string" ? { type: "ui_prompt_closed", promptId: record.promptId } : undefined;
@@ -1020,7 +1020,7 @@ function reducedRemoteUiPromptResultEvent(event: unknown): RemoteUiPromptResultE
   const record = event as Record<string, unknown>;
   if (record.type !== "remote_ui_prompt_result" || typeof record.requestId !== "string" || typeof record.promptId !== "string") return undefined;
   if (record.ok === true) return { type: "remote_ui_prompt_result", requestId: record.requestId, promptId: record.promptId, ok: true };
-  const errors = new Set(["ui_prompt_closed", "invalid_ui_prompt_response", "option_not_found"]);
+  const errors = new Set<string>(UI_PROMPT_ANSWER_ERRORS);
   if (record.ok !== false || typeof record.error !== "string" || !errors.has(record.error)) return undefined;
   return { type: "remote_ui_prompt_result", requestId: record.requestId, promptId: record.promptId, ok: false, error: record.error as Extract<RemoteUiPromptResultEvent, { ok: false }>["error"] };
 }

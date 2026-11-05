@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { buildUiPrompt, optionIndexForId, validateUiPromptResponse, type UiPrompt, type UiPromptKind, type UiPromptResponse, type UiPromptResponseError, type UiPromptSpec } from "../ui-prompt.js";
+import { buildUiPrompt, optionIndexForId, validateUiPromptResponse, type UiPrompt, type UiPromptKind, type UiPromptResponse, type UiPromptAnswerError, type UiPromptSpec } from "../ui-prompt.js";
 
 // Pi gives every extension the same mutable `ctx.ui` object and has no API for answering another
 // extension's dialog. The bridge wraps that shared object's dialog methods so the owning TUI can
@@ -10,7 +10,7 @@ export type UiPromptBridgeListener = {
   closed(sessionId: string, promptId: string): void;
 };
 
-export type UiPromptAnswerResult = { ok: true } | { ok: false; error: "ui_prompt_closed" | UiPromptResponseError };
+export type UiPromptAnswerResult = { ok: true } | { ok: false; error: UiPromptAnswerError };
 
 type DialogMethod = (...args: unknown[]) => unknown;
 
